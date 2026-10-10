@@ -1,0 +1,33 @@
+# 비밀이 아닌 설정. 자격증명은 k8s/secrets/*.example.yaml 참고.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-config
+  namespace: stock-trading
+data:
+  # demo(모의투자) | real(실전). real 은 kis-api-secret 에 KIS_REAL_CONFIRM 이 있어야 기동한다.
+  KIS_ENV: "demo"
+  KIS_ACCOUNT_PRODUCT: "01"
+
+  # 매매수수료율 — 기본값 없음. 계좌의 실제 수수료율을 확인해서 채운다.
+  # 비어 있으면 엔진이 기동을 거부한다 (의도된 동작).
+  FEE_RATE: ""
+
+  UNIVERSE: "005930,000660"
+  STRATEGIES: "ema_crossover"
+  STRATEGY_PARAMS: "{}"
+  SIGNAL_TIME: "09:10"
+
+  RISK_PER_TRADE_KRW: "50000"
+  MAX_POSITION_KRW: "2000000"
+  MAX_POSITIONS: "5"
+  DAILY_LOSS_LIMIT_KRW: "200000"
+  MAX_CONSECUTIVE_ERRORS: "5"
+  GAP_SCENARIO_PCT: "0.10"
+
+  STOP_POLL_SEC: "5"
+  ORDER_POLL_SEC: "10"
+  RECONCILE_SEC: "300"
+  QUOTE_STALE_SEC: "30"
+  ENTRY_ORDER_TIMEOUT_SEC: "120"
+  LOG_LEVEL: "INFO"

@@ -1,0 +1,41 @@
+# 장 마감 후 성과 리포트 (stock-trading-book-audit 형식) → 텔레그램. 평일 16:20 KST.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: performance-report
+  namespace: stock-trading
+  labels:
+    app.kubernetes.io/part-of: stock-trading-kr
+spec:
+  schedule: "20 16 * * 1-5"
+  timeZone: "Asia/Seoul"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: dockerhub-credentials
+          containers:
+            - name: report
+              image: neidn/stock-trading-kr:latest
+              imagePullPolicy: Always
+              command: ["python", "-m", "src.audit.report", "--days", "90", "--telegram"]
+              envFrom:
+                - configMapRef:
+                    name: trading-config
+                - secretRef:
+                    name: telegram-secret
+                - secretRef:
+                    name: postgres-secret
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "300m"
+                  memory: "256Mi"

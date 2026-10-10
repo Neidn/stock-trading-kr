@@ -1,0 +1,64 @@
+# 트레이딩 엔진. 손절 감시·체결 동기화·진입이 한 프로세스에 있다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trader
+  namespace: stock-trading
+  labels:
+    app: trader
+    app.kubernetes.io/part-of: stock-trading-kr
+spec:
+  # 반드시 1. 매도 주문을 내는 프로세스가 둘이면 같은 수량을 두 번 팔 수 있다.
+  replicas: 1
+  # Recreate: RollingUpdate 는 교체 중 두 파드가 동시에 주문을 낼 수 있다.
+  # 대가는 재시작 동안 몇 초의 손절 공백이다. 새 파드는 기동 직후 손절부터 점검한다.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: trader
+  template:
+    metadata:
+      labels:
+        app: trader
+    spec:
+      priorityClassName: stock-trading-critical
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: dockerhub-credentials
+      containers:
+        - name: trader
+          image: neidn/stock-trading-kr:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "src.engine.main"]
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: trading-config
+            - secretRef:
+                name: kis-api-secret
+            - secretRef:
+                name: telegram-secret
+            - secretRef:
+                name: postgres-secret
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

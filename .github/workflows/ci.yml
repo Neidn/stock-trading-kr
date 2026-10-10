@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "k8s/**"
+      - "**.md"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 테스트가 통과해야 이미지를 만든다.
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: trading
+          POSTGRES_DB: trading_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trading" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://trading:trading@localhost:5432/trading_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  # Docker Hub 시크릿(DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)이 있을 때만 푸시한다.
+  image:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - id: check
+        env:
+          USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: echo "ok=$([ -n "$USER" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.check.outputs.ok != 'true'
+        run: echo "::warning::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN 시크릿이 없어 이미지 푸시를 건너뜁니다"
+      - if: steps.check.outputs.ok == 'true'
+        uses: actions/checkout@v4
+      - if: steps.check.outputs.ok == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - if: steps.check.outputs.ok == 'true'
+        uses: docker/setup-buildx-action@v3
+      - if: steps.check.outputs.ok == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - if: steps.check.outputs.ok == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            neidn/stock-trading-kr:latest
+            neidn/stock-trading-kr:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea
+.claude
+# 실제 시크릿 매니페스트는 커밋하지 않는다 (예시 파일만 커밋)
+k8s/secrets/*.yaml
+!k8s/secrets/*.yaml.example
