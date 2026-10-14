@@ -3,6 +3,8 @@
 * 수량 = floor(건당 리스크 금액 ÷ 주당 리스크). 1주 미만이면 진입하지 않는다 —
   1주로 올리면 리스크가 의도보다 커진다.
 * 주문금액 ≤ 증권사 주문가능금액(미수 없는 매수금액). 예수금을 직접 계산하지 않는다.
+* 구조 규칙: 종목당 매수금액 ≤ 순자산 × max_position_pct, 진입 후 현금 ≥ 순자산 ×
+  min_cash_pct. 하한가 잠김·갭은 손절로 못 막으므로 종목당 상한이 실제 최대손실을 정한다.
 """
 
 from __future__ import annotations
@@ -18,7 +20,9 @@ class SizeResult:
 
 
 def size_entry(*, entry_price: int, stop_price: float, risk_per_trade_krw: int,
-               max_position_krw: int, buyable_cash: int, fee_rate: float) -> SizeResult:
+               max_position_krw: int, buyable_cash: int, fee_rate: float,
+               equity: int | None = None, max_position_pct: float = 1.0,
+               min_cash_pct: float = 0.0) -> SizeResult:
     per_share_risk = entry_price - stop_price
     if entry_price <= 0 or per_share_risk <= 0:
         return SizeResult(0, f"invalid stop (entry={entry_price}, stop={stop_price})")
@@ -26,11 +30,17 @@ def size_entry(*, entry_price: int, stop_price: float, risk_per_trade_krw: int,
     if by_risk < 1:
         return SizeResult(0, f"risk per share {per_share_risk:,.0f} > budget {risk_per_trade_krw:,}"
                              " (1주 미만 — 올림 진입하지 않음)")
-    by_cap = math.floor(max_position_krw / entry_price)
-    by_cash = math.floor(buyable_cash / (entry_price * (1 + fee_rate)))
-    qty = min(by_risk, by_cap, by_cash)
+    caps = {
+        "max_position_krw": math.floor(max_position_krw / entry_price),
+        "cash": math.floor(buyable_cash / (entry_price * (1 + fee_rate))),
+    }
+    if equity is not None:
+        caps["max_position_pct"] = math.floor(equity * max_position_pct / entry_price)
+        spendable = buyable_cash - equity * min_cash_pct
+        caps["min_cash_pct"] = max(math.floor(spendable / (entry_price * (1 + fee_rate))), 0)
+    qty = min(by_risk, *caps.values())
     if qty < 1:
-        which = "cash" if by_cash < 1 else "max_position_krw"
+        which = next(k for k, v in caps.items() if v < 1)
         return SizeResult(0, f"{which} limit (entry {entry_price:,})")
     return SizeResult(qty, "")
 

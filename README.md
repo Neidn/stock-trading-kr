@@ -3,14 +3,16 @@
 한국투자증권 OpenAPI로 국내주식(KRX 정규장, 롱 온리)을 자동매매하는 봇입니다.
 k3s에 올리고, PostgreSQL은 같은 네임스페이스에 파드로 띄우며, 알림은 텔레그램으로 받습니다.
 
-설계 기준은 `neidn/ai-skills`의 두 스킬입니다.
+설계 기준은 `neidn/ai-skills`의 세 스킬입니다.
 
 - `stock-trading-execution` — 주문·체결·손절·대조·킬 스위치
-- `stock-trading-book-audit` — 손익 원장, 비용 차감 net, 표본·판정 규칙
+- `stock-trading-book-audit` — 손익 원장, 비용 차감 net, 표본·판정 규칙, 구조 규칙 준수 점검
+- `trade-history-analysis` — 체결 재구성·행동 지표. aoa 사례에서 "구조"로 판정된 규칙(종목당 상한, 낙폭 정지)의 근거
 
 전략 인터페이스와 지표는 `binance_futures_autotrading`(commit f9b5621)에서 가져왔습니다.
 
-> **현재 단계: 모의투자 배선 검증.** 아래 "실전 전환 게이트"를 통과하기 전에는 `KIS_ENV=real`로 바꾸지 마세요.
+> **현재 단계: 모의투자 배선 검증.** 로컬에서 돌리려면 아래 "로컬 모의투자 (docker compose)"부터 보세요.
+> 아래 "실전 전환 게이트"를 통과하기 전에는 `KIS_ENV=real`로 바꾸지 마세요.
 > 실전으로 바꾸려면 `KIS_REAL_CONFIRM` 시크릿도 넣어야 하고, 이 값이 없으면 엔진이 기동을 거부합니다.
 
 ## 구조
@@ -61,11 +63,62 @@ k8s/           namespace, priorityclass, postgres, trader, cronjobs, configmap, 
 | 토큰 공유 캐시, 갱신 실패는 치명 | `broker_tokens` 테이블 + advisory lock. `BrokerAuthError`가 나면 알림 후 종료(exit 2) |
 | 대조에서 증권사가 진실, 정수배 차이는 기업행위로 의심 | 종목 잠금 + 킬 스위치 1단계. 정수배 차이일 때는 손절도 보류하고 사람에게 넘김 |
 | 킬 스위치 3단계 | 자동 트리거는 1단계까지만 올림. 2·3단계는 CLI로 사람이 설정 |
+| 종목당 상한·현금 하한 (순자산 대비) | `size_entry`의 `max_position_pct`·`min_cash_pct`. 순자산(총평가금액)을 모르면 그날 진입하지 않음 |
+| 자산 고점 대비 낙폭 → 신규 진입 중지 | `equity_snapshots`(장 마감 기록) 최대값 대비 현재 총평가금액. `DRAWDOWN_HALT_PCT` 이상이면 킬 스위치 1단계 |
+| 물타기 금지 | 보유 중이거나 열린 주문이 있는 종목은 신규 진입 대상에서 뺌 |
+| 지정가 진입, 쫓아가지 않음 | `ENTRY_ORDER_TIMEOUT_SEC` 지나면 취소. 신호는 하루 1회이고, 장중 재시작해도 오늘 진입 주문이 있었으면 다시 평가하지 않음 |
+| 휴장일 API 없이 개장 확인 (모의) | 휴장일 조회 실패 시 주말은 휴장, 평일은 장 시작 2분 뒤부터 일봉에 오늘 봉이 생기면 개장으로 확정. 확인 전에는 진입만 막고 손절은 동작 (휴장으로 단정하지 않음) |
+| 모의 설정에 실전 도메인 금지 | `KIS_ENV=demo`인데 `KIS_BASE_URL`이 실전이면 기동 거부 |
 | 수수료·세금 차감 net, 비용 추정 여부 표시 | `fills.cost_source='estimated'`, 리포트 전제 절에 표시 |
 | 매매당 net + N + 진입일 수, 표본이 부족하면 보류 | `src/audit/report.py` |
 
 **봇이 사지 않은 보유 종목은 팔지 않습니다.** 대조 시 "unmanaged" 알림만 보냅니다.
 봇 전용 계좌를 권장합니다. 기존 보유분을 봇이 관리하게 하려면 `cli adopt`로 명시적으로 편입하세요.
+
+## 로컬 모의투자 (docker compose)
+
+PC 한 대에서 Postgres와 봇을 띄웁니다. **PC가 잠들거나 꺼지면 손절 감시도 멈춥니다.**
+모의 단계에서는 괜찮지만, 실전은 k3s처럼 계속 켜져 있는 곳에서 돌립니다.
+
+**준비 (본인이 할 일)**
+
+1. 한국투자증권 계좌 → KIS Developers 가입 → **모의투자 신청** → 모의 계좌번호(8자리)와
+   **모의용 앱키·시크릿**을 받습니다. 실전 앱키와 다릅니다.
+2. `cp .env.example .env` 후 채웁니다. **실전 키는 넣지 않습니다.**
+   - `KIS_ENV=demo`, `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`(모의 계좌 앞 8자리)
+   - `FEE_RATE` — 기본값이 없습니다. 실전 계좌 수수료율을 확인해 넣습니다(모의는 비용이 추정치)
+   - `POSTGRES_PASSWORD` — 아무 긴 문자열 (`openssl rand -hex 24`)
+   - 텔레그램은 선택입니다. 비우면 로그로만 남습니다.
+   - `UNIVERSE`, `STRATEGIES`, 리스크 값은 기본값으로 시작해도 됩니다.
+
+**실행**
+
+```bash
+docker compose up -d postgres
+docker compose run --rm trader python -m scripts.kis_smoke 005930   # 조회만, 주문 없음
+docker compose up -d trader
+docker compose logs -f trader
+```
+
+`kis_smoke`는 토큰·현재가·일봉·잔고·매수가능·당일주문·휴장일을 한 번씩 조회합니다.
+**장중에 한 번** 돌려서 다음을 확인합니다.
+
+- `FAIL`이 하나라도 있으면 봇을 띄우지 않습니다. 토큰 실패면 앱키가 모의용인지 봅니다.
+- `일봉 … today_bar=True` — 엔진이 이것으로 개장을 확인합니다. `False`면 모의에서는 신규 진입이 나가지 않습니다(손절은 동작).
+- `휴장일`의 `WARN`은 모의에서 예상된 결과입니다.
+
+**운영 명령**
+
+```bash
+docker compose exec trader python -m src.cli status
+docker compose exec trader python -m src.cli kill 1 --reason "점검"     # 0 = 해제
+docker compose exec trader python -m src.audit.report --days 30
+docker compose exec postgres pg_dump -U trading trading | gzip > backup_$(date +%F).sql.gz
+docker compose stop trader      # 멈추면 손절 감시도 멈춘다. 먼저 kill 2 로 미체결 정리 권장
+```
+
+**롤백:** `git checkout <이전 커밋> && docker compose up -d --build trader`. DB는 위 백업으로 복원합니다.
+마이그레이션 003(`equity_snapshots`)은 테이블 추가만 하므로 이전 코드로 돌아가도 영향이 없습니다.
 
 ## 배포 (k3s)
 
@@ -113,6 +166,26 @@ kubectl -n stock-trading exec deploy/trader -- python -m src.cli unlock 005930  
 kubectl -n stock-trading exec deploy/trader -- python -m src.audit.report --days 30
 ```
 
+### 구조 규칙 준수 점검 (trade-history-analysis)
+
+성과를 보기 전에, 넣은 규칙이 체결에서 실제로 지켜지는지 봅니다 (`stock-trading-book-audit` 3절).
+
+```bash
+python -m src.audit.export --days 90 --out out/          # fills.csv, equity.csv
+python <ai-skills>/skills/trade-history-analysis/scripts/reconstruct_trades.py \
+    out/fills.csv --format generic --equity out/equity.csv --out out/analysis/
+```
+
+| 지표 | 기대값 | 어긋나면 |
+|---|---|---|
+| `avg_down%` | 0 | 물타기 금지가 안 지켜짐 — 재진입 경로 확인 |
+| `exposure_x_p90` | ≤ `MAX_POSITION_PCT` | 사이징이 상한을 안 읽음 |
+| `hold_h_med_loss` ÷ `hold_h_med_win` | 1 근처 | 2 이상이면 손절 공백(재시작·VI·갭) 의심 |
+
+- `fee`는 수수료+거래세 **추정치**입니다(`cost_source=estimated`).
+- 분석기는 **전일** 자산으로 노출 배수를 계산하므로, 장 마감 스냅샷이 이틀 이상 쌓여야 `exposure_x`가 나옵니다.
+- `limit%`는 진입(지정가)과 손절(시장가)이 섞인 값입니다. 진입만 보려면 `purpose == entry` 행으로 거릅니다.
+
 | 킬 스위치 | 동작 | 누가 거나 |
 |---|---|---|
 | 1 | 신규 진입 중지 (손절·청산은 계속) | 일손실 한도, 연속 API 오류, 대조 불일치, 시세 갱신 실패 시 자동 |
@@ -142,7 +215,9 @@ DB 테스트는 실제 Postgres를 사용합니다(매 테스트마다 스키마
 - 오류 코드 `EGW00201`(호출 제한), `EGW00123`/`EGW00121`(토큰).
 - 시장경고코드·종목상태코드의 값 의미(`mrkt_warn_cls_code` 02/03, `iscd_stat_cls_code` 58).
 - 일별체결조회의 취소 주문 레코드 판정(`orgn_odno` + `cncl_yn`), `ord_gno_brno`를 정정·취소 조직번호로 쓸 수 있는지.
-- 휴장일 조회가 모의투자에서 되는지. 안 되면 신규 진입은 중지되고 손절만 동작합니다.
+- 휴장일 조회가 모의투자에서 되는지. 공식 샘플(조회일 2026-10-14)에 모의 TR이 없어 **미지원으로 추정**합니다.
+  엔진은 실패하면 일봉으로 개장을 확인합니다. 모의 일봉 API가 장중에 오늘 봉을 주는지는 `kis_smoke`의 `today_bar`로 확인합니다.
+- 모의 체결에 수수료·세금이 실제로 붙는지. 기간별매매손익 API(`TTTC8715R`)는 샘플에 모의 TR이 없어 증권사 비용과 대조할 수 없습니다.
 - 장 세션 시간, 호가단위, 세율. 스킬 레퍼런스(2026-10 기준) 값을 넣었고 `tax_rates.verified = FALSE`입니다.
   KRX·국세청 자료로 확인한 뒤 `UPDATE tax_rates SET verified = TRUE, checked_on = ...`로 바꿉니다.
 - 수수료율. 기본값을 두지 않았으므로 `FEE_RATE`에 직접 넣어야 합니다.
@@ -155,10 +230,13 @@ DB 테스트는 실제 Postgres를 사용합니다(매 테스트마다 스키마
 - [ ] 대조 불일치 0이 5거래일 연속
 - [ ] 위 "미확인" 항목 확인 (특히 세율·수수료율·호출 한도)
 - [ ] 킬 스위치 1·2·3단계를 모의 계좌에서 실제로 눌러봄
+- [ ] 구조 규칙 준수 점검(`src.audit.export` → `reconstruct_trades.py`)에서 위반 0
+- [ ] `MAX_POSITION_PCT`·`MIN_CASH_PCT`·`DRAWDOWN_HALT_PCT`를 실전 기준으로 다시 정함 (지금 값은 모의용 기본값)
 - [ ] 성과 판단은 `stock-trading-book-audit` 5절 게이트를 따름 (모의 성과는 근거가 아님)
 
 ## 다음 단계
 
+- 분할 청산 (TP 2~3단계, 보유 수량이 단계 수보다 적으면 단일 청산)
 - NXT·KRX 애프터마켓 (세션 테이블 `venue` 확장, 주문 `EXCG_ID_DVSN_CD`)
 - 실시간 체결통보 웹소켓(H0STCNI0) — 현재는 REST 폴링과 대조로 처리
 - 벤치마크(KOSPI/KOSDAQ) 차감 리포트

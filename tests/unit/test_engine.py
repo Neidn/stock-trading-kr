@@ -52,7 +52,7 @@ def engine(db, settings, rules, notes, clock):
     broker.set_quote(CODE, 70050)
     broker.candles[CODE] = candles(clock)
     eng = Engine(settings, broker, Store(), rules, notes, clock=clock,
-                 rules_loader=lambda: rules, calendar_saver=lambda d, v: None)
+                 rules_loader=lambda: rules, calendar_saver=lambda *a, **k: None)
     eng.startup()
     return eng, broker
 

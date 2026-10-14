@@ -24,6 +24,10 @@ data:
   DAILY_LOSS_LIMIT_KRW: "200000"
   MAX_CONSECUTIVE_ERRORS: "5"
   GAP_SCENARIO_PCT: "0.10"
+  # 구조 규칙 (순자산 대비) — 모의 단계용 보수적 기본값
+  MAX_POSITION_PCT: "0.20"
+  MIN_CASH_PCT: "0.20"
+  DRAWDOWN_HALT_PCT: "0.10"
 
   STOP_POLL_SEC: "5"
   ORDER_POLL_SEC: "10"

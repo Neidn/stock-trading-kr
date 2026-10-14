@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from src.broker.base import Broker, BrokerError, Holding
+from src.broker.base import AccountSummary, Broker, BrokerError, Holding
 from src.execution.order_manager import DuplicateOrderBlocked, OrderManager
 from src.execution.store import Store
 from src.risk.kill_switch import KillSwitch
@@ -37,6 +37,7 @@ class StopMonitor:
         self.clock = clock
         self.last_ok: datetime | None = None
         self.last_holdings: list[Holding] = []
+        self.last_summary: AccountSummary | None = None
 
     def tick(self, *, can_trade: bool) -> list[dict]:
         """Check every bot position once. Returns the exit orders submitted.
@@ -45,7 +46,7 @@ class StopMonitor:
         """
         now = self.clock()
         try:
-            holdings, _summary = self.broker.holdings()
+            holdings, summary = self.broker.holdings()
         except BrokerError as exc:
             log.warning("holdings query failed: %s", exc)
             if self.last_ok and (now - self.last_ok).total_seconds() > self.stale_sec:
@@ -55,6 +56,7 @@ class StopMonitor:
             return []
         self.last_ok = now
         self.last_holdings = holdings
+        self.last_summary = summary
 
         by_code = {h.code: h for h in holdings}
         positions = self.store.positions()
@@ -122,3 +124,18 @@ class StopMonitor:
         if pnl <= -self.daily_loss_limit:
             self.kill.auto_trip(f"daily loss {pnl:,} <= -{self.daily_loss_limit:,}")
         return pnl
+
+    def check_drawdown(self, peak: int, halt_pct: float) -> float | None:
+        """계좌 고점(일별 스냅샷 최대) 대비 현재 총평가금액 낙폭. 넘으면 1단계.
+
+        aoa 사례의 "큰 낙폭 뒤 축소"를 옮긴 것이다. 자동으로는 1단계(신규 진입 중지)까지만
+        걸고, 해제는 사람이 원인을 본 뒤 CLI 로 한다. 입출금이 섞이면 틀린다 — 출금 직후에는
+        사람이 확인한다.
+        """
+        cur = self.last_summary.total_eval if self.last_summary else 0
+        if peak <= 0 or cur <= 0:
+            return None
+        dd = 1 - cur / peak
+        if dd >= halt_pct:
+            self.kill.auto_trip(f"drawdown {dd:.1%} >= {halt_pct:.0%} (peak {peak:,}, now {cur:,})")
+        return dd

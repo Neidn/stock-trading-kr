@@ -18,7 +18,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from src.broker.base import Broker, BrokerAuthError, BrokerError
 from src.engine.entries import EntryPlanner
@@ -34,11 +34,17 @@ from src.risk.sizing import worst_case_loss
 from src.risk.stop_monitor import StopMonitor
 from src.signal.registry import load_strategies
 from src.utils.config import Settings
-from src.utils.time_utils import now_kst, parse_hhmm
+from src.utils.time_utils import now_kst, parse_hhmm, ymd
 
 log = logging.getLogger(__name__)
 
 TRADING_SESSIONS = (Session.CONTINUOUS, Session.CLOSING_AUCTION)
+
+# 휴장일 API(CTCA0903R)는 공식 샘플에 모의 TR 이 없다 → 모의에서는 실패하는 것으로 본다.
+# 그 경우 장 시작 후 일봉에 오늘 봉이 생겼는지로 개장을 확인한다.
+CALENDAR_CONFIRM_DELAY = timedelta(minutes=2)    # 장 시작 후 이만큼 지나서 확인 시작
+CALENDAR_CONFIRM_GIVE_UP = timedelta(minutes=30)  # 이때까지 확인 못하면 알림 (휴장 단정은 안 함)
+CALENDAR_PROBE_CODES = 3
 
 
 class Engine:
@@ -73,6 +79,7 @@ class Engine:
         self.eod_done = False
         self.last_level = 0
         self.errors = 0
+        self.equity_peak = 0
         self._due: dict[str, float] = {}
         self._running = True
 
@@ -105,6 +112,7 @@ class Engine:
         _, can_exit = self._session(now)
         # 2. 손절 점검이 다른 어떤 것보다 먼저다.
         self.stops.tick(can_trade=can_exit)
+        self.stops.check_drawdown(self.equity_peak, self.s.risk.drawdown_halt_pct)
         # 3-4. 주문·체결·잔고 대조
         self.reconciler.run(now.date())
         self.last_level = self.kill.level()
@@ -119,13 +127,18 @@ class Engine:
             # 휴장일 조회는 하루 1회 권장 API 다. 실패해도 루프에서 재시도하지 않는다.
             log.warning("holiday lookup failed: %s", exc)
             open_day = None
+        source = "kis"
+        if open_day is None and d.weekday() >= 5:
+            open_day, source = False, "weekday"
         if open_day is not None:
-            self._save_calendar(d, open_day)
-        else:
-            self.notify(f"⚠️ {d} 개장일 여부 확인 실패 — 신규 진입 중지, 손절만 동작", key=f"cal:{d}")
+            self._save_calendar(d, open_day, source=source)
         self.rules = self._load_rules()
         if open_day is not None:
             self.rules.calendar[d] = open_day
+        elif self.rules.is_open_day(d) is None:
+            # 재시작이면 오늘 이미 일봉으로 확인해 DB 에 남겼을 수 있다 (위 load 가 읽는다).
+            self.notify(f"⚠️ {d} 휴장일 API로 개장 여부를 확인하지 못함 — 장 시작 후 일봉으로 "
+                        "확인할 때까지 신규 진입 중지, 손절은 동작", key=f"cal:{d}")
         self.costs.rules = self.rules
         self.entries.rules = self.rules
 
@@ -140,8 +153,11 @@ class Engine:
             self.store.upsert_instrument(code, q.name, q.market, reason is None, reason)
             if reason and code in self.store.positions():
                 self.notify(f"⚠️ 보유 종목 {code} 상태: {reason}", key=f"inst:{code}:{reason}")
+        self.equity_peak = self.store.equity_peak()
         self.day = d
-        self.signals_done = False
+        # 장중 재시작이면 오늘 신호를 다시 평가하지 않는다. 시간 초과로 취소된 진입을 새 가격으로
+        # 다시 내면 "쫓아가지 않는다"(지정가 진입 후 포기) 규칙을 어긴다.
+        self.signals_done = self.store.entry_orders_on(d) > 0
         self.eod_done = False
 
     # ── 루프 ────────────────────────────────────────────────────────────────
@@ -149,6 +165,7 @@ class Engine:
         now = self.clock()
         if now.date() != self.day:
             self.daily_prep(now.date())
+        self._confirm_calendar(now)          # 세션 판정 전에 — 확인된 그 step 부터 반영
         sess, can_exit = self._session(now)
         e = self.s.engine
 
@@ -157,6 +174,7 @@ class Engine:
         if sess not in (Session.CLOSED, Session.AFTER_CLOSE) and self._due_now("stop", e.stop_poll_sec):
             self.stops.tick(can_trade=can_exit)
             self.stops.check_daily_loss(self.store.realized_net_on(now.date()))
+            self.stops.check_drawdown(self.equity_peak, self.s.risk.drawdown_halt_pct)
 
         if can_exit and self._due_now("orders", e.order_poll_sec):
             self.orders.sync(now.date())
@@ -174,6 +192,42 @@ class Engine:
             self.end_of_day(now.date())
 
         self.health.beat(session=sess.value, kill=self.last_level)
+
+    def _set_calendar(self, d: date, is_open: bool, source: str) -> None:
+        self._save_calendar(d, is_open, source=source)
+        self.rules.calendar[d] = is_open
+
+    def _confirm_calendar(self, now: datetime) -> None:
+        """휴장일 API 를 못 쓸 때: 장 시작 후 일봉에 오늘 봉이 있으면 개장으로 확정한다.
+
+        휴장으로 단정하지는 않는다. CLOSED 로 판정하면 손절 감시까지 멈추기 때문이다.
+        확인 전까지는 UNKNOWN 이고, 그동안 신규 진입은 막히고 손절은 동작한다.
+        """
+        d = now.date()
+        if self.rules.is_open_day(d) is not None:
+            return
+        times = self.rules.session_times(d)
+        opened_at = datetime.combine(d, times.regular_open, tzinfo=now.tzinfo)
+        if now < opened_at + CALENDAR_CONFIRM_DELAY or now.time() >= times.regular_close:
+            return
+        # 포기 시점 이후에는 드물게 본다 (개장 지연일 대비). 호출 한도는 손절 감시와 같이 쓴다.
+        every = 60 if now < opened_at + CALENDAR_CONFIRM_GIVE_UP else 600
+        if not self._due_now("calendar", every):
+            return
+        for code in self.s.engine.universe[:CALENDAR_PROBE_CODES]:
+            try:
+                df = self.broker.daily_candles(code, 2)
+            except BrokerError as exc:
+                log.warning("calendar probe %s failed: %s", code, exc)
+                continue
+            if not df.empty and str(df["date"].iloc[-1]) == ymd(d):
+                self._set_calendar(d, True, "candle")
+                self.notify(f"✅ {d} 개장 확인 (일봉 {code}) — 신규 진입 허용", key=f"calok:{d}")
+                return
+        if now >= opened_at + CALENDAR_CONFIRM_GIVE_UP:
+            self.notify(f"⚠️ {d} {CALENDAR_CONFIRM_GIVE_UP.seconds // 60}분이 지나도 오늘 일봉이 "
+                        "없음 — 휴장일이거나 시세 조회 문제. 신규 진입 중지 유지, 손절은 동작",
+                        key=f"calgiveup:{d}")
 
     def _apply_kill_transitions(self, can_exit: bool) -> None:
         level = self.kill.level()
@@ -203,6 +257,18 @@ class Engine:
         for p in positions:
             p["last_price"] = by_code.get(p["code"])
         wc = worst_case_loss(positions, self.s.risk.gap_scenario_pct, self.s.risk.daily_loss_limit_krw)
+        equity_line = "자산: 조회 실패 (스냅샷 미기록)"
+        try:
+            _, summary = self.broker.holdings()
+        except BrokerError as exc:
+            log.warning("equity snapshot skipped: %s", exc)
+        else:
+            if summary.total_eval > 0:
+                self.store.record_equity(d, summary.total_eval, summary.deposit)
+                self.equity_peak = max(self.equity_peak, summary.total_eval)
+                dd = 1 - summary.total_eval / self.equity_peak
+                equity_line = (f"자산 {summary.total_eval:,}원 · 고점 대비 −{dd:.1%} "
+                               f"(정지 기준 −{self.s.risk.drawdown_halt_pct:.0%})")
         lines = [
             f"📊 장 마감 {d} ({self.s.kis.env})",
             f"실현 net(추정 비용 차감): {realized:,}원",
@@ -210,6 +276,7 @@ class Engine:
             f"보유 {len(positions)}종목 · 최대손실 시나리오 {wc['total']:,}원 "
             f"(일한도 {wc['daily_loss_limit']:,} + 갭 {wc['gap_scenario']:,})",
             f"대조: {'불일치 0' if res.clean else f'불일치 {len(res.mismatches)}'}",
+            equity_line,
         ]
         if leftover:
             lines.append(f"⚠️ 마감 후에도 open 상태 주문 {len(leftover)}건 — 확인 필요")

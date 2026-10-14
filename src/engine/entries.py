@@ -36,6 +36,7 @@ class EntryPlanner:
         self.cfg = engine_cfg
         self.risk = risk_cfg
         self.notify = notify if notify is not None else (lambda *a, **k: None)
+        self.equity = 0
 
     def _min_candles(self) -> int:
         return max((s.get_min_candles() for s in self.strategies), default=0) + 5
@@ -43,6 +44,17 @@ class EntryPlanner:
     def run(self, now: datetime) -> list[dict]:
         if not self.kill.entries_allowed():
             log.info("entries skipped: kill switch level %d", self.kill.level())
+            return []
+        # 종목당 상한·현금 하한은 순자산 기준이다. 순자산을 모르면 진입하지 않는다.
+        try:
+            _, summary = self.broker.holdings()
+        except BrokerError as exc:
+            log.warning("entries skipped: holdings failed: %s", exc)
+            return []
+        self.equity = summary.total_eval
+        if self.equity <= 0:
+            log.warning("entries skipped: equity unknown (total_eval=%s)", self.equity)
+            self.notify("⚠️ 순자산 조회값이 0 — 오늘 신규 진입 건너뜀", key=f"equity0:{now.date()}")
             return []
         submitted: list[dict] = []
         locks = self.store.locked_symbols()
@@ -117,6 +129,9 @@ class EntryPlanner:
             max_position_krw=self.risk.max_position_krw,
             buyable_cash=self.broker.buyable_cash(code, entry),
             fee_rate=self.risk.fee_rate,
+            equity=self.equity,
+            max_position_pct=self.risk.max_position_pct,
+            min_cash_pct=self.risk.min_cash_pct,
         )
         if size.qty == 0:
             self._record(code, strat, sig, size.reason)

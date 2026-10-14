@@ -218,7 +218,7 @@ def test_restart_checks_stops_before_order_sync(settings, rules, notes, clock):
     broker.calls.clear()
 
     eng = Engine(settings, broker, store, rules, notes, clock=clock,
-                 rules_loader=lambda: rules, calendar_saver=lambda d, v: None)
+                 rules_loader=lambda: rules, calendar_saver=lambda *a, **k: None)
     eng.startup()
     calls = [c for c in broker.calls if not c.startswith("quote")]
     first_sell = calls.index(f"place:{CODE}:sell:10")
@@ -233,7 +233,7 @@ def test_kill_level1_blocks_entries_but_stops_work(settings, rules, notes, clock
     broker.set_quote(CODE, 70000)
     store = Store()
     eng = Engine(settings, broker, store, rules, notes, clock=clock,
-                 rules_loader=lambda: rules, calendar_saver=lambda d, v: None)
+                 rules_loader=lambda: rules, calendar_saver=lambda *a, **k: None)
     eng.startup()
     eng.kill.auto_trip("test")
     assert eng.entries.run(clock()) == []
