@@ -92,6 +92,12 @@ class Store:
             cur.execute(sql + " ORDER BY id", args)
             return cur.fetchall()
 
+    def entry_orders_on(self, d: date) -> int:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM orders WHERE purpose = 'entry' AND trade_date = %s",
+                        (d,))
+            return int(cur.fetchone()["n"])
+
     def known_order_nos(self) -> set[str]:
         with db_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT order_no FROM orders WHERE order_no IS NOT NULL "
@@ -292,6 +298,22 @@ class Store:
             cur.execute("SELECT COALESCE(SUM(net_pnl), 0) AS s FROM trades "
                         "WHERE (exit_at AT TIME ZONE 'Asia/Seoul')::date = %s", (d,))
             return int(cur.fetchone()["s"])
+
+    # ── equity ───────────────────────────────────────────────────────────────
+    def record_equity(self, d: date, total_eval: int, deposit: int) -> None:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO equity_snapshots (trade_date, total_eval, deposit)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (trade_date) DO UPDATE SET total_eval = EXCLUDED.total_eval,
+                       deposit = EXCLUDED.deposit, recorded_at = now()""",
+                (d, total_eval, deposit),
+            )
+
+    def equity_peak(self) -> int:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(total_eval), 0) AS m FROM equity_snapshots")
+            return int(cur.fetchone()["m"])
 
     def fill_sources_on(self, d: date) -> dict[str, int]:
         with db_conn() as conn, conn.cursor() as cur:

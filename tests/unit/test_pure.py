@@ -115,6 +115,25 @@ class TestSizing:
     def test_invalid_stop(self):
         assert size_entry(entry_price=70000, stop_price=71000, **self.kw).qty == 0
 
+    def test_capped_by_equity_pct(self):
+        # 순자산 2,000,000 × 20% = 400,000 → 70,000원 5주 (리스크 기준 10주보다 작다)
+        r = size_entry(entry_price=70000, stop_price=65000, **self.kw,
+                       equity=2_000_000, max_position_pct=0.20)
+        assert r.qty == 5
+
+    def test_cash_floor_keeps_reserve(self):
+        # 현금 1,000,000 중 순자산 2,000,000 × 40% = 800,000 은 남긴다 → 200,000 으로 2주
+        kw = {**self.kw, "buyable_cash": 1_000_000}
+        r = size_entry(entry_price=70000, stop_price=65000, **kw,
+                       equity=2_000_000, min_cash_pct=0.40)
+        assert r.qty == 2
+
+    def test_cash_floor_blocks_entry(self):
+        kw = {**self.kw, "buyable_cash": 300_000}
+        r = size_entry(entry_price=70000, stop_price=65000, **kw,
+                       equity=2_000_000, min_cash_pct=0.20)
+        assert r.qty == 0 and "min_cash_pct" in r.reason
+
     def test_worst_case(self):
         wc = worst_case_loss([{"qty": 10, "avg_price": 70000, "stop_price": 65000,
                                "last_price": 70000}], 0.10, 200_000)
@@ -139,6 +158,20 @@ class TestConfig:
     def test_demo_defaults(self, settings):
         assert settings.kis.base_url.startswith("https://openapivts")
         assert settings.kis.rps == 2.0
+
+    def test_demo_refuses_real_domain(self, settings, monkeypatch):
+        from src.utils.config import KIS_URLS, ConfigError, load_kis
+        monkeypatch.setenv("KIS_BASE_URL", KIS_URLS["real"] + "/")
+        with pytest.raises(ConfigError):
+            load_kis()
+
+    def test_structure_rule_defaults_and_ranges(self, settings, monkeypatch):
+        from src.utils.config import ConfigError, load_risk
+        r = settings.risk
+        assert (r.max_position_pct, r.min_cash_pct, r.drawdown_halt_pct) == (0.20, 0.20, 0.10)
+        monkeypatch.setenv("MIN_CASH_PCT", "1.0")
+        with pytest.raises(ConfigError):
+            load_risk()
         assert "12345678" not in repr(settings)
 
     def test_codes_are_strings(self, settings, monkeypatch):
